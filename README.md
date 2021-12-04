@@ -44,7 +44,7 @@ Each event is on its own line, and and is composed of UTF-8 text:
 
 # data must be valid UTF-8 text.
 # binary data must be escaped.
-# the following escapes are can be used:
+# the following escape sequences are available:
 #
 #  \\         backslash
 #  \r         cartridge return
