@@ -8,6 +8,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"time"
 )
@@ -44,11 +45,13 @@ type ReplayConn struct {
 	lineNo int
 
 	readDeadline time.Time
+	readerCount  int
 	readBuf      []byte
 	readPos      int
 	readErr      error
 
 	writeDeadline time.Time
+	writerCount   int
 	writeBuf      []byte
 	writePos      int
 	writeErr      error
@@ -309,6 +312,11 @@ func (rp *ReplayConn) Read(b []byte) (n int, err error) {
 	rp.m.Lock()
 	defer rp.m.Unlock()
 
+	rp.readerCount++
+	defer func() {
+		rp.readerCount--
+	}()
+
 	for {
 		if !rp.readDeadline.IsZero() && !rp.readDeadline.After(time.Now()) {
 			err = rp.opErr("read", os.ErrDeadlineExceeded)
@@ -346,6 +354,11 @@ func (rp *ReplayConn) Read(b []byte) (n int, err error) {
 func (rp *ReplayConn) Write(b []byte) (n int, err error) {
 	rp.m.Lock()
 	defer rp.m.Unlock()
+
+	rp.writerCount++
+	defer func() {
+		rp.writerCount--
+	}()
 
 	for {
 		if rp.closed && n != len(b) {
@@ -445,4 +458,55 @@ func (rp *ReplayConn) SetWriteDeadline(t time.Time) error {
 	rp.readDeadline = t
 	rp.c.Broadcast()
 	return nil
+}
+
+func formatBuffer(pos int, buf []byte) string {
+	return fmt.Sprintf("┆%s‸%s┆ %d/%d", escape(buf[:pos]), escape(buf[pos:]), pos, len(buf))
+}
+
+func (rp *ReplayConn) DebugStatus() string {
+	var b strings.Builder
+	now := time.Now()
+
+	rp.m.Lock()
+	defer rp.m.Unlock()
+
+	fmt.Fprintf(&b, " == connection status: ==\n")
+	fmt.Fprintf(&b, "current line:   %d\n", rp.lineNo)
+
+	var deadline string
+	switch {
+	case rp.readDeadline.IsZero():
+		deadline = "unset"
+	case rp.readDeadline.Before(now):
+		deadline = "expired"
+	default:
+		deadline = rp.readDeadline.Sub(now).String()
+	}
+
+	fmt.Fprintf(&b, "read deadline:  %s\n", deadline)
+	fmt.Fprintf(&b, "reader count:   %d\n", rp.readerCount)
+	fmt.Fprintf(&b, "read buffer:   %s\n", formatBuffer(rp.readPos, rp.readBuf))
+	fmt.Fprintf(&b, "read error:     %v\n", rp.readErr)
+	fmt.Fprintf(&b, "\n")
+
+	switch {
+	case rp.writeDeadline.IsZero():
+		deadline = "unset"
+	case rp.writeDeadline.Before(now):
+		deadline = "expired"
+	default:
+		deadline = rp.writeDeadline.Sub(now).String()
+	}
+
+	fmt.Fprintf(&b, "write deadline: %s\n", deadline)
+	fmt.Fprintf(&b, "writer count:   %d\n", rp.writerCount)
+	fmt.Fprintf(&b, "write buffer:  %s\n", formatBuffer(rp.writePos, rp.writeBuf))
+	fmt.Fprintf(&b, "write error:    %v\n", rp.writeErr)
+	fmt.Fprintf(&b, "\n")
+
+	fmt.Fprintf(&b, "closed:         %v\n", rp.closed)
+	fmt.Fprintf(&b, "close error:    %v\n", rp.closeErr)
+
+	return b.String()
 }
