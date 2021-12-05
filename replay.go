@@ -33,11 +33,13 @@ type Opts struct {
 	FailBlockedReads bool
 }
 
-type replay struct {
-	opts Opts
-
+type ReplayConn struct {
 	m sync.Mutex
 	c sync.Cond
+
+	failBlockedReads bool
+
+	localAddr, remoteAddr net.Addr
 
 	lineNo int
 
@@ -57,16 +59,28 @@ type replay struct {
 	closed bool
 }
 
-func Replay(r io.Reader, opts Opts) net.Conn {
-	if opts.LocalAddr == nil {
-		opts.LocalAddr = localAddr
-	}
+// SetAddr sets the addresses reported by the connection.
+//
+// Defaults to "local" and "remote" on the network "fake".
+func (rp *ReplayConn) SetAddr(local, remote net.Addr) *ReplayConn {
+	rp.m.Lock()
+	defer rp.m.Unlock()
+	rp.localAddr, rp.remoteAddr = local, remote
+	return rp
+}
 
-	if opts.RemoteAddr == nil {
-		opts.RemoteAddr = remoteAddr
-	}
+func (rp *ReplayConn) FailBlockedReads(fail bool) *ReplayConn {
+	rp.m.Lock()
+	defer rp.m.Unlock()
+	rp.failBlockedReads = fail
+	return rp
+}
 
-	rp := replay{opts: opts}
+func Replay(r io.Reader) *ReplayConn {
+	rp := ReplayConn{
+		localAddr:  localAddr,
+		remoteAddr: remoteAddr,
+	}
 	rp.c.L = &rp.m
 
 	rp.wg.Add(2)
@@ -142,7 +156,7 @@ func parseLine(s *bufio.Scanner) (line streamLine, err error) {
 	return
 }
 
-func (rp *replay) setErrs(read, write, close error) {
+func (rp *ReplayConn) setErrs(read, write, close error) {
 	if read != nil {
 		rp.readPos, rp.readBuf = 0, nil
 		if rp.readErr == nil {
@@ -162,7 +176,7 @@ func (rp *replay) setErrs(read, write, close error) {
 	}
 }
 
-func (rp *replay) handleRead(r io.Reader) {
+func (rp *ReplayConn) handleRead(r io.Reader) {
 	defer rp.wg.Done()
 
 	s := bufio.NewScanner(r)
@@ -210,7 +224,7 @@ func (rp *replay) handleRead(r io.Reader) {
 	}
 }
 
-func (rp *replay) handleDeadlineUpdates(deadlines <-chan time.Time) {
+func (rp *ReplayConn) handleDeadlineUpdates(deadlines <-chan time.Time) {
 	defer rp.wg.Done()
 
 	t := time.NewTimer(0)
@@ -241,7 +255,7 @@ func (rp *replay) handleDeadlineUpdates(deadlines <-chan time.Time) {
 	}
 }
 
-func (rp *replay) handleDeadline() {
+func (rp *ReplayConn) handleDeadline() {
 	defer rp.wg.Done()
 
 	deadlines := make(chan time.Time)
@@ -276,23 +290,33 @@ func (rp *replay) handleDeadline() {
 	}
 }
 
-func (rp *replay) Read(b []byte) (n int, err error) {
+func (rp *ReplayConn) opErr(op string, err error) error {
+	if err == io.EOF {
+		// Don't wrap EOF
+		return io.EOF
+	}
+
+	return &net.OpError{
+		Op:     op,
+		Net:    rp.localAddr.Network(),
+		Source: rp.localAddr,
+		Addr:   rp.remoteAddr,
+		Err:    err,
+	}
+}
+
+func (rp *ReplayConn) Read(b []byte) (n int, err error) {
 	rp.m.Lock()
 	defer rp.m.Unlock()
 
 	for {
 		if !rp.readDeadline.IsZero() && !rp.readDeadline.After(time.Now()) {
-			err = &net.OpError{Op: "read", Net: rp.opts.LocalAddr.Network(), Source: rp.opts.LocalAddr, Addr: rp.opts.RemoteAddr, Err: os.ErrDeadlineExceeded}
+			err = rp.opErr("read", os.ErrDeadlineExceeded)
 			return
 		}
 
 		if rp.readErr != nil {
-			if rp.readErr == io.EOF {
-				err = io.EOF
-			} else {
-				err = &net.OpError{Op: "read", Net: rp.opts.LocalAddr.Network(), Source: rp.opts.LocalAddr, Addr: rp.opts.RemoteAddr, Err: rp.readErr}
-			}
-
+			err = rp.opErr("write", rp.readErr)
 			return
 		}
 
@@ -308,13 +332,10 @@ func (rp *replay) Read(b []byte) (n int, err error) {
 			return
 		}
 
-		if rp.writePos != len(rp.writeBuf) && rp.opts.FailBlockedReads {
+		if rp.writePos != len(rp.writeBuf) && rp.failBlockedReads {
 			e := fmt.Errorf("line %d: %w: waiting for a write of %q", rp.lineNo, errBadRead, rp.writeBuf[rp.writePos:])
 			rp.setErrs(errBrokenPipe, errBrokenPipe, e)
-			err = &net.OpError{
-				Op: "read", Net: rp.opts.LocalAddr.Network(), Source: rp.opts.LocalAddr, Addr: rp.opts.RemoteAddr,
-				Err: e,
-			}
+			err = rp.opErr("read", e)
 			return
 		}
 
@@ -322,7 +343,7 @@ func (rp *replay) Read(b []byte) (n int, err error) {
 	}
 }
 
-func (rp *replay) Write(b []byte) (n int, err error) {
+func (rp *ReplayConn) Write(b []byte) (n int, err error) {
 	rp.m.Lock()
 	defer rp.m.Unlock()
 
@@ -330,17 +351,17 @@ func (rp *replay) Write(b []byte) (n int, err error) {
 		if rp.closed && n != len(b) {
 			e := fmt.Errorf("line %d: %w: data=%q expected=%q", rp.lineNo, errBadWrite, b, b[:n])
 			rp.setErrs(errBrokenPipe, errBrokenPipe, e)
-			err = &net.OpError{Op: "write", Net: rp.opts.LocalAddr.Network(), Source: rp.opts.LocalAddr, Addr: rp.opts.RemoteAddr, Err: e}
+			err = rp.opErr("write", e)
 			return
 		}
 
 		if !rp.writeDeadline.IsZero() && !rp.writeDeadline.After(time.Now()) {
-			err = &net.OpError{Op: "write", Net: rp.opts.LocalAddr.Network(), Source: rp.opts.LocalAddr, Addr: rp.opts.RemoteAddr, Err: os.ErrDeadlineExceeded}
+			err = rp.opErr("write", os.ErrDeadlineExceeded)
 			return
 		}
 
 		if rp.writeErr != nil {
-			err = &net.OpError{Op: "write", Net: rp.opts.LocalAddr.Network(), Source: rp.opts.LocalAddr, Addr: rp.opts.RemoteAddr, Err: rp.writeErr}
+			err = rp.opErr("write", rp.writeErr)
 			return
 		}
 
@@ -350,17 +371,14 @@ func (rp *replay) Write(b []byte) (n int, err error) {
 
 		if rp.writePos != len(rp.writeBuf) {
 			l := len(b) - n
-			if l > len(rp.writeBuf) {
-				l = len(rp.writeBuf)
+			if l > len(rp.writeBuf)-rp.writePos {
+				l = len(rp.writeBuf) - rp.writePos
 			}
 
-			if !bytes.Equal(b[n:n+l], rp.writeBuf[:l]) {
+			if !bytes.Equal(b[n:n+l], rp.writeBuf[rp.writePos:rp.writePos+l]) {
 				e := fmt.Errorf("line %d: %w: data=%q expected=%q", rp.lineNo, errBadWrite, append(rp.writeBuf[:rp.writePos:rp.writePos], b[n:]...), rp.writeBuf)
 				rp.setErrs(errBrokenPipe, errBrokenPipe, e)
-				err = &net.OpError{
-					Op: "write", Net: rp.opts.LocalAddr.Network(), Source: rp.opts.LocalAddr, Addr: rp.opts.RemoteAddr,
-					Err: e,
-				}
+				err = rp.opErr("write", e)
 				return
 			}
 
@@ -380,7 +398,7 @@ func (rp *replay) Write(b []byte) (n int, err error) {
 	}
 }
 
-func (rp *replay) Close() error {
+func (rp *ReplayConn) Close() error {
 	rp.m.Lock()
 	rp.closed = true
 	rp.c.Broadcast()
@@ -389,15 +407,19 @@ func (rp *replay) Close() error {
 	return rp.closeErr
 }
 
-func (rp *replay) LocalAddr() net.Addr {
-	return rp.opts.LocalAddr
+func (rp *ReplayConn) LocalAddr() net.Addr {
+	rp.m.Lock()
+	defer rp.m.Unlock()
+	return rp.localAddr
 }
 
-func (rp *replay) RemoteAddr() net.Addr {
-	return rp.opts.RemoteAddr
+func (rp *ReplayConn) RemoteAddr() net.Addr {
+	rp.m.Lock()
+	defer rp.m.Unlock()
+	return rp.remoteAddr
 }
 
-func (rp *replay) SetDeadline(t time.Time) error {
+func (rp *ReplayConn) SetDeadline(t time.Time) error {
 	rp.m.Lock()
 	defer rp.m.Unlock()
 
@@ -407,7 +429,7 @@ func (rp *replay) SetDeadline(t time.Time) error {
 	return nil
 }
 
-func (rp *replay) SetReadDeadline(t time.Time) error {
+func (rp *ReplayConn) SetReadDeadline(t time.Time) error {
 	rp.m.Lock()
 	defer rp.m.Unlock()
 
@@ -416,7 +438,7 @@ func (rp *replay) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
-func (rp *replay) SetWriteDeadline(t time.Time) error {
+func (rp *ReplayConn) SetWriteDeadline(t time.Time) error {
 	rp.m.Lock()
 	defer rp.m.Unlock()
 

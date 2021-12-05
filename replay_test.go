@@ -16,7 +16,7 @@ func ExampleReplay() {
 -> 3
 `
 
-	c := Replay(strings.NewReader(events), Opts{})
+	c := Replay(strings.NewReader(events))
 
 	var (
 		len int
@@ -39,6 +39,6 @@ func ExampleReplay() {
 	// read:  data="Hello\n" err=<nil>
 	// read:  data="♥World" err=<nil>
 	// read:  data="" err=EOF
-	// write: size=3 err=write fake local->remote: line 7: bad write: data="123456" expected="123"
-	// close: err=line 7: bad write: data="123456" expected="123"
+	// write: size=3 err=write fake local->remote: line 8: bad write: data="123456" expected="123"
+	// close: err=line 8: bad write: data="123456" expected="123"
 }
